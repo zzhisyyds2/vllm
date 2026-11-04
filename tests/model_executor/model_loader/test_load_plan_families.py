@@ -25,6 +25,7 @@ from safetensors.torch import load_file, save_file
 
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.engine.arg_utils import EngineArgs
+from vllm.model_executor.model_loader.reload import plan_loads
 from vllm.model_executor.model_loader.reload.plan import LoadPlan
 from vllm.model_executor.model_loader.utils import initialize_model
 from vllm.platforms import current_platform
@@ -33,8 +34,9 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 from .test_load_plan import (
     BF16,
     _cold_start,
-    _plan,
+    _metadata,
     _planned_reload,
+    _registrations,
     _state,
 )
 
@@ -376,6 +378,25 @@ def _vllm_config(path: Path) -> VllmConfig:
     ).create_engine_config()
 
 
+def _raw(t: torch.Tensor) -> torch.Tensor:
+    """The bytes of ``t``; unlike ``t.view(torch.uint8)``, also for 0-d tensors
+    (real models have scalar scales, which ``test_load_plan.py`` toys lack)."""
+    return t.reshape(-1).view(torch.uint8)
+
+
+def _plan(model, shapes) -> LoadPlan:
+    """``plan_loads``, checking that planning changed no tensor, address,
+    registration or module attribute (as ``test_load_plan._plan``, with 0-d
+    tensors allowed)."""
+    state, registrations = _state(model), _registrations(model)
+    plan = plan_loads(model, _metadata(shapes))
+    assert _registrations(model) == registrations
+    for name, (dtype, shape, data, ptr) in _state(model).items():
+        assert (dtype, shape, ptr) == (*state[name][:2], state[name][3]), name
+        assert torch.equal(_raw(data), _raw(state[name][2])), name
+    return plan
+
+
 def _summary(family: str, plan: LoadPlan, specs: list[Spec], model) -> dict:
     kinds = Counter()
     nbytes = Counter()
@@ -420,12 +441,14 @@ def test_plan_equals_cold_start(dist_init, tmp_path, family):
     vllm_config = _vllm_config(tmp_path)
 
     def make():
+        # one config per model: each registers its layers by name
+        config = _vllm_config(tmp_path)
         with (
-            set_current_vllm_config(vllm_config),
+            set_current_vllm_config(config),
             set_default_torch_dtype(torch.bfloat16),
             torch.device(current_platform.device_type),
         ):
-            return initialize_model(vllm_config)
+            return initialize_model(config)
 
     with set_current_vllm_config(vllm_config):
         model = _cold_start(make, start)
@@ -439,11 +462,11 @@ def test_plan_equals_cold_start(dist_init, tmp_path, family):
     for name, (dtype, shape, data, ptr) in actual.items():
         assert (dtype, shape) == expected[name][:2], name
         want = expected[name][2]
-        assert torch.equal(data.view(torch.uint8), want.view(torch.uint8)), name
+        assert torch.equal(_raw(data), _raw(want)), name
         assert ptr == before[name][3], f"{name} moved"
     # the second checkpoint really replaced the first
     assert any(
-        not torch.equal(before[n][2].view(torch.uint8), d.view(torch.uint8))
+        not torch.equal(_raw(before[n][2]), _raw(d))
         for n, (_, _, d, _) in actual.items()
     )
     summary = _summary(family, plan, specs, model)
